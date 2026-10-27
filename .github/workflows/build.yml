@@ -16,21 +16,24 @@ jobs:
         include:
           - os: windows-latest
             name: windows-x64
+            rustflags: "-C target-cpu=x86-64-v2"
             bin: target/release/sluiceULPmax.exe
             out: sluiceULPmax-windows-x64.exe
           - os: ubuntu-latest
             name: linux-x64
+            rustflags: "-C target-cpu=x86-64-v2"
             bin: target/release/sluiceULPmax
             out: sluiceULPmax-linux-x64
           - os: macos-latest
             name: macos-arm64
+            rustflags: ""
             bin: target/release/sluiceULPmax
             out: sluiceULPmax-macos-arm64
 
     runs-on: ${{ matrix.os }}
     env:
-      # сборка для чужих машин: без инструкций, которых нет на старых процессорах
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
+      # x86 собираем под безопасный базовый набор, arm64 — как есть
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v4
 
