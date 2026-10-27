@@ -28,6 +28,9 @@ jobs:
             out: sluiceULPmax-macos-arm64
 
     runs-on: ${{ matrix.os }}
+    env:
+      # сборка для чужих машин: без инструкций, которых нет на старых процессорах
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - uses: actions/checkout@v4
 
