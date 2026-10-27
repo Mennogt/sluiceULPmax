@@ -1,0 +1,19 @@
+[package]
+name = "sluiceulp"
+version = "1.0.0"
+edition = "2021"
+description = "One pass over dumps, any number of literals"
+
+[[bin]]
+name = "sluiceULPmax"
+path = "src/main.rs"
+
+[dependencies]
+aho-corasick = "1"
+memchr = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
