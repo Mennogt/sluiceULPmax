@@ -34,7 +34,7 @@ extern "system" {
     fn SetConsoleOutputCP(code: u32) -> i32;
 }
 
-pub const VERSION: &str = "1.0.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ─────────────────────────────────────────────────────────── чтение по смещению
 
@@ -410,11 +410,14 @@ pub fn recommend(disk: f64, scan: f64, cores: usize) -> usize {
     if scan <= 1.0 || disk <= 1.0 {
         return cores;
     }
-    let need_cold = (disk / (scan * 0.8)).ceil() as usize;
+    // сколько потоков нужно, чтобы загрузить диск: диск / (скорость потока × 0.8)
+    let need = (disk / (scan * 0.8)).ceil() as usize;
     if disk < 250.0 {
-        need_cold.clamp(2, cores)
+        // медленный носитель: больше потоков только мешают
+        need.clamp(2, cores)
     } else {
-        cores
+        // быстрый: разрешаем переподписку до двух раз, это помогает прятать задержки ввода-вывода
+        need.clamp(2, cores * 2)
     }
 }
 

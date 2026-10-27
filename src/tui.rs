@@ -482,6 +482,7 @@ struct Res {
 
 struct App {
     step: usize,
+    threads: Option<usize>,
     paths: Vec<PathItem>,
     sel: usize,
     focus: usize,
@@ -504,6 +505,7 @@ impl App {
     fn new() -> App {
         App {
             step: 0,
+            threads: None,
             paths: Vec::new(),
             sel: 0,
             focus: 3,
@@ -835,6 +837,12 @@ fn handle_ev(app: &mut App, ev: Ev, screen: &mut Screen) -> io::Result<bool> {
             }
             'c' if app.step == 2 => app.count_only = !app.count_only,
             'p' if app.step == 2 => return Ok(activate(app, "pickDir", screen)?),
+            '+' | '=' if app.step == 2 => return Ok(activate(app, "cycleThreads", screen)?),
+            '-' | '_' if app.step == 2 => {
+                const STEPS: [Option<usize>; 8] = [None, Some(2), Some(4), Some(8), Some(12), Some(16), Some(24), Some(32)];
+                let cur = STEPS.iter().position(|x| *x == app.threads).unwrap_or(0);
+                app.threads = STEPS[(cur + STEPS.len() - 1) % STEPS.len()];
+            }
             _ => {}
         },
         Ev::Text(s) => {
@@ -890,6 +898,11 @@ fn activate(app: &mut App, action: &str, screen: &mut Screen) -> io::Result<bool
             app.format = if app.format == Format::Full { Format::Login } else { Format::Full };
         }
         "toggleCount" => app.count_only = !app.count_only,
+        "cycleThreads" => {
+            const STEPS: [Option<usize>; 8] = [None, Some(2), Some(4), Some(8), Some(12), Some(16), Some(24), Some(32)];
+            let cur = STEPS.iter().position(|x| *x == app.threads).unwrap_or(0);
+            app.threads = STEPS[(cur + 1) % STEPS.len()];
+        }
         "pickDir" => {
             if let Some(p) = native_pick(screen, true) {
                 let t = p.lines().next().unwrap_or("").trim().trim_matches('"').to_string();
@@ -968,7 +981,18 @@ fn start(app: &mut App) -> io::Result<()> {
         .sum();
     let engine = Arc::new(Engine::build(&names, true, "filter"));
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let threads = cores.max(2);
+    let threads = match app.threads {
+        Some(n) => n,
+        None => {
+            // авто: замеряем диск и скорость сканера на первом файле
+            let first_len = files.first().and_then(|f| fs::metadata(f).ok()).map(|m| m.len()).unwrap_or(0);
+            let (disk, scan) = match open_sequential(&files[0]) {
+                Ok(fh) if first_len > 64 * 1024 * 1024 => crate::probe_speeds(&fh, first_len, &engine, 32),
+                _ => (0.0, 0.0),
+            };
+            crate::recommend(disk, scan, cores)
+        }
+    };
     let prog = Arc::new(Prog::new(engine.npat(), total));
     let handle = spawn_multi(Arc::clone(&engine), files, threads, 32, Arc::clone(&prog));
 
@@ -1212,6 +1236,11 @@ fn screen_for(app: &mut App, w: usize) -> Vec<String> {
                 .unwrap_or_else(|_| app.out_dir.clone());
             v.push(format!("               {}{}{}", DIM, abs, RESET));
             v.push(String::new());
+            let thr_txt = match app.threads {
+                None => format!("{}авто{} — по замеру диска и ядер", WHITE, RESET),
+                Some(n) => format!("{}{}{} {}", WHITE, n, RESET, DIM),
+            };
+            v.push(format!("  {}потоки{}        {}", DIM, RESET, thr_txt));
             v.push(format!(
                 "  {}к запуску:{} {} источников · {} · {} запросов",
                 DIM, RESET, app.paths.len(), human(app.total_bytes() as f64), qs.len()
@@ -1220,12 +1249,13 @@ fn screen_for(app: &mut App, w: usize) -> Vec<String> {
             let list = [
                 Btn { label: "формат".into(), action: "toggleFormat" },
                 Btn { label: "счётчики".into(), action: "toggleCount" },
+                Btn { label: "потоки".into(), action: "cycleThreads" },
                 Btn { label: "папка".into(), action: "pickDir" },
                 Btn { label: "назад".into(), action: "back" },
                 Btn { label: "запустить".into(), action: "run" },
             ];
             let y = v.len();
-            v.push(draw_buttons(&list, app.focus.min(4), y, w, app));
+            v.push(draw_buttons(&list, app.focus.min(5), y, w, app));
         }
         3 => {
             let (bytes, hits) = app
@@ -1310,7 +1340,7 @@ fn screen_for(app: &mut App, w: usize) -> Vec<String> {
     let hint = match app.step {
         0 => "↑↓ выбор · Tab кнопки · Enter нажать · Del убрать · Q выход",
         1 => "печатай или вставляй · Ctrl+V вставить · Enter далее · Q выход",
-        2 => "Tab кнопки · Enter нажать · F формат · C счётчики · P папка · Esc назад",
+        2 => "Tab кнопки · Enter нажать · F формат · C счётчики · P папка · +/− потоки · Esc назад",
         3 => "Esc — прервать",
         _ => "Enter — заново · Q — выход",
     };
