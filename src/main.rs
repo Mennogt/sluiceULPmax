@@ -459,6 +459,13 @@ pub fn sanitize(p: &str) -> String {
 // ─────────────────────────────────────────────────────────── main
 
 fn main() -> io::Result<()> {
+    // при любой панике сначала возвращаем терминал в нормальное состояние,
+    // иначе на экране остаётся мусор из недорисованного кадра
+    std::panic::set_hook(Box::new(|info| {
+        tui::restore_terminal();
+        eprintln!("\n  ошибка: {}\n  пришли этот текст разработчику\n", info);
+    }));
+
     #[cfg(windows)]
     unsafe {
         SetConsoleOutputCP(65001);
@@ -468,7 +475,9 @@ fn main() -> io::Result<()> {
 
     // без аргументов и в терминале — интерфейс
     let force_tui = std::env::var("SLUICE_FORCE_TUI").map(|v| v == "1").unwrap_or(false);
-    if force_tui || (args.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal()) {
+    let no_tui = std::env::var("SLUICE_NO_TUI").map(|v| v == "1").unwrap_or(false)
+        || args.iter().any(|a| a == "--no-tui");
+    if !no_tui && (force_tui || (args.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal())) {
         return tui::run();
     }
 
@@ -509,6 +518,7 @@ fn main() -> io::Result<()> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--no-tui" => {}
             "--count" => count_only = true,
             "--tsv" => tsv = true,
             "--no-ci" => no_ci = true,

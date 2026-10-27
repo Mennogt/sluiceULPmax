@@ -117,6 +117,7 @@ struct Screen {
 
 impl Screen {
     fn enter() -> Screen {
+        remember_termios();
         #[cfg(windows)]
         unsafe {
             let hin = win::GetStdHandle(win::STD_INPUT);
@@ -192,6 +193,38 @@ impl Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         self.off();
+    }
+}
+
+// ─────────────────────────────────────────────────────────── аварийное восстановление
+
+// Вызывается из panic-хука: терминал должен вернуться в нормальное состояние,
+// даже если программа падает в середине кадра.
+#[cfg(unix)]
+static SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+
+pub fn remember_termios() {
+    #[cfg(unix)]
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut t) == 0 {
+            if let Ok(mut g) = SAVED_TERMIOS.lock() {
+                *g = Some(t);
+            }
+        }
+    }
+}
+
+pub fn restore_terminal() {
+    print!("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+    let _ = io::stdout().flush();
+    #[cfg(unix)]
+    unsafe {
+        if let Ok(g) = SAVED_TERMIOS.lock() {
+            if let Some(t) = *g {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t);
+            }
+        }
     }
 }
 
