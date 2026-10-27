@@ -1,0 +1,64 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            bin: target/release/sluiceULPmax.exe
+            out: sluiceULPmax-windows-x64.exe
+          - os: ubuntu-latest
+            name: linux-x64
+            bin: target/release/sluiceULPmax
+            out: sluiceULPmax-linux-x64
+          - os: macos-latest
+            name: macos-arm64
+            bin: target/release/sluiceULPmax
+            out: sluiceULPmax-macos-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --release
+
+      - name: rename
+        shell: bash
+        run: cp "${{ matrix.bin }}" "${{ matrix.out }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.out }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
