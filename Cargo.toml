@@ -3,6 +3,8 @@ name = "sluiceulp"
 version = "1.0.0"
 edition = "2021"
 description = "One pass over dumps, any number of literals"
+license = "MIT"
+repository = "https://github.com/Mennogt/sluiceULPmax"
 
 [[bin]]
 name = "sluiceULPmax"
@@ -11,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 aho-corasick = "1"
 memchr = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

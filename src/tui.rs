@@ -4,13 +4,12 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::mpsc::{channel, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
     human, open_sequential, parse_cred, sanitize, start_scan, strip_cr, Engine, Prog, ScanPlan,
-    VERSION,
 };
 
 // ─────────────────────────────────────────────────────────── цвета
@@ -21,19 +20,12 @@ const GRAY: &str = "\x1b[38;5;245m";
 const WHITE: &str = "\x1b[38;5;252m";
 const BOLD: &str = "\x1b[1m";
 const CYAN: &str = "\x1b[38;5;45m";
-const BLUE: &str = "\x1b[38;5;39m";
 const GREEN: &str = "\x1b[38;5;114m";
-const YELLOW: &str = "\x1b[38;5;221m";
-const MAGENTA: &str = "\x1b[38;5;170m";
 const INV: &str = "\x1b[7m";
 
 fn no_color() -> bool {
     static ONCE: AtomicBool = AtomicBool::new(false);
     ONCE.load(Ordering::Relaxed)
-}
-pub fn set_plain() {
-    static SET: AtomicBool = AtomicBool::new(false);
-    if !SET.swap(true, Ordering::Relaxed) {}
 }
 
 // ─────────────────────────────────────────────────────────── консоль
@@ -99,6 +91,13 @@ fn term_size() -> (usize, usize) {
 
 #[cfg(not(windows))]
 fn term_size() -> (usize, usize) {
+    #[cfg(unix)]
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return ((ws.ws_col as usize).max(20), (ws.ws_row as usize).max(10));
+        }
+    }
     (100, 30)
 }
 
@@ -111,6 +110,8 @@ struct Screen {
     want_in: u32,
     #[cfg(windows)]
     want_out: u32,
+    #[cfg(unix)]
+    orig: Option<libc::termios>,
     active: bool,
 }
 
@@ -131,7 +132,13 @@ impl Screen {
             s.on();
             return s;
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        {
+            let mut s = Screen { orig: None, active: false };
+            s.on();
+            return s;
+        }
+        #[cfg(not(any(windows, unix)))]
         {
             let mut s = Screen { active: false };
             s.on();
@@ -143,6 +150,18 @@ impl Screen {
         unsafe {
             win::SetConsoleMode(win::GetStdHandle(win::STD_INPUT), self.want_in);
             win::SetConsoleMode(win::GetStdHandle(win::STD_OUTPUT), self.want_out);
+        }
+        #[cfg(unix)]
+        unsafe {
+            if self.orig.is_none() {
+                let mut t: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(libc::STDIN_FILENO, &mut t) == 0 {
+                    self.orig = Some(t);
+                    let mut raw = t;
+                    libc::cfmakeraw(&mut raw);
+                    libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
+                }
+            }
         }
         print!("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J");
         let _ = io::stdout().flush();
@@ -159,6 +178,13 @@ impl Screen {
         unsafe {
             win::SetConsoleMode(win::GetStdHandle(win::STD_INPUT), self.in_mode);
             win::SetConsoleMode(win::GetStdHandle(win::STD_OUTPUT), self.out_mode);
+        }
+        #[cfg(unix)]
+        unsafe {
+            if let Some(t) = self.orig {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t);
+                self.orig = None;
+            }
         }
     }
 }
@@ -239,19 +265,6 @@ fn center(s: &str, w: usize) -> String {
     format!("{}{}", " ".repeat((w - n) / 2), s)
 }
 
-fn trunc_mid(s: &str, w: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= w || w < 8 {
-        return s.chars().take(w).collect();
-    }
-    let keep = w - 1;
-    let left = keep / 2;
-    let right = keep - left;
-    let mut out: String = chars[..left].iter().collect();
-    out.push('…');
-    out.extend(&chars[chars.len() - right..]);
-    out
-}
 
 fn plural(n: usize, one: &str, few: &str, many: &str) -> &'static str {
     let _ = n;
@@ -442,6 +455,7 @@ enum Target {
     OutDir,
 }
 
+#[allow(dead_code)]
 struct Run {
     prog: Arc<Prog>,
     handle: Option<std::thread::JoinHandle<io::Result<crate::ScanOut>>>,
@@ -455,6 +469,7 @@ struct Run {
     live: bool,
 }
 
+#[allow(dead_code)]
 struct Res {
     counts: Vec<u64>,
     patterns: Vec<String>,

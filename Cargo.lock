@@ -12,6 +12,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22,5 +28,6 @@ name = "sluiceulp"
 version = "1.0.0"
 dependencies = [
  "aho-corasick",
+ "libc",
  "memchr",
 ]
