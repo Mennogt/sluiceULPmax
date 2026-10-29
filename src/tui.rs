@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    human, open_sequential, parse_cred, sanitize, start_scan, strip_cr, Engine, Prog, ScanPlan,
+    human, open_sequential, start_scan, Engine, Prog, ScanPlan,
 };
 
 // ─────────────────────────────────────────────────────────── цвета
@@ -491,6 +491,7 @@ enum Target {
 #[allow(dead_code)]
 struct Run {
     prog: Arc<Prog>,
+    sink: Option<crate::Sink>,
     handle: Option<std::thread::JoinHandle<io::Result<crate::ScanOut>>>,
     started: Instant,
     names: Vec<String>,
@@ -723,8 +724,11 @@ pub fn run() -> io::Result<()> {
                 if h.is_finished() {
                     let mut run = app.run.take().unwrap();
                     let out = run.handle.take().unwrap().join().unwrap()?;
-                    let matched = out.hits.len();
-                    let files = if run.count_only { 0 } else { write_results(&run, &out)? };
+                    let matched = out.hits as usize;
+                    let files = match run.sink.take() {
+                        Some(s) => s.finish().unwrap_or(0),
+                        None => 0,
+                    };
                     app.res = Some(Res {
                         counts: out.counts,
                         patterns: run.names.clone(),
@@ -986,7 +990,7 @@ fn next(app: &mut App) {
     }
     app.msg.clear();
     app.step = (app.step + 1).min(2);
-    app.focus = if app.step == 2 { 4 } else { 0 };
+    app.focus = if app.step == 2 { 5 } else { 0 };
 }
 
 fn back(app: &mut App) {
@@ -1027,10 +1031,13 @@ fn start(app: &mut App) -> io::Result<()> {
         }
     };
     let prog = Arc::new(Prog::new(engine.npat(), total));
-    let handle = spawn_multi(Arc::clone(&engine), files, threads, 32, Arc::clone(&prog));
+    let fmt = match app.format { Format::Full => "url", Format::Login => "login" };
+    let sink = crate::Sink::new(names.clone(), app.out_dir.clone(), fmt.to_string(), !app.count_only);
+    let handle = spawn_multi(Arc::clone(&engine), files, threads, 32, Arc::clone(&prog), sink.sender());
 
     app.run = Some(Run {
         prog,
+        sink: Some(sink),
         handle: Some(handle),
         started: Instant::now(),
         names: names.clone(),
@@ -1051,10 +1058,13 @@ fn spawn_multi(
     threads: usize,
     chunk: usize,
     prog: Arc<Prog>,
+    lines_tx: Option<std::sync::mpsc::SyncSender<(u32, Vec<u8>)>>,
 ) -> std::thread::JoinHandle<io::Result<crate::ScanOut>> {
     std::thread::spawn(move || {
         let t0 = Instant::now();
-        let mut all: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut chunk_mb = chunk.max(1);
+        crate::cache_budget(threads, &mut chunk_mb);
+        let mut hits_total = 0u64;
         let mut bytes = 0u64;
         for f in files {
             if prog.stop.load(Ordering::Relaxed) {
@@ -1070,14 +1080,14 @@ fn spawn_multi(
             };
             let per_file = ((meta.len() / (8 * 1024 * 1024)) as usize).max(1);
             let th = threads.max(1).min(per_file);
-            let plan = ScanPlan::build(Arc::clone(&fh), meta.len(), th, chunk, engine.max_len().max(1), true)?;
-            let h = start_scan(Arc::clone(&engine), plan, Arc::clone(&prog));
+            let plan = ScanPlan::build(Arc::clone(&fh), meta.len(), th, chunk_mb, engine.max_len().max(1), true)?;
+            let h = start_scan(Arc::clone(&engine), plan, Arc::clone(&prog), lines_tx.clone());
             let out = h.join().unwrap()?;
             bytes += out.bytes;
-            all.extend(out.hits);
+            hits_total += out.hits;
         }
         let counts = prog.counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-        Ok(crate::ScanOut { counts, hits: all, bytes, secs: t0.elapsed().as_secs_f64() })
+        Ok(crate::ScanOut { counts, hits: hits_total, bytes, secs: t0.elapsed().as_secs_f64() })
     })
 }
 
@@ -1139,35 +1149,6 @@ fn native_pick(screen: &mut Screen, dir_mode: bool) -> Option<String> {
     Some(t)
 }
 
-fn write_results(run: &Run, out: &crate::ScanOut) -> io::Result<usize> {
-    fs::create_dir_all(&run.out_dir)?;
-    let mut files: Vec<Option<fs::File>> = (0..run.names.len()).map(|_| None).collect();
-    let mut written = 0usize;
-    for (p, line) in &out.hits {
-        let idx = *p as usize;
-        if files[idx].is_none() {
-            let name = sanitize(&run.names[idx]);
-            files[idx] = Some(fs::File::create(Path::new(&run.out_dir).join(format!("{name}.txt")))?);
-            written += 1;
-        }
-        let mut buf: Vec<u8> = Vec::new();
-        match run.format {
-            Format::Login => {
-                if let Some((_, login, pass)) = parse_cred(line) {
-                    buf.extend_from_slice(login);
-                    buf.push(b':');
-                    buf.extend_from_slice(pass);
-                } else {
-                    buf.extend_from_slice(strip_cr(line));
-                }
-            }
-            Format::Full => buf.extend_from_slice(strip_cr(line)),
-        }
-        buf.push(b'\n');
-        files[idx].as_mut().unwrap().write_all(&buf)?;
-    }
-    Ok(written)
-}
 
 // ─────────────────────────────────────────────────────────── экраны
 

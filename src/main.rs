@@ -10,12 +10,13 @@
 mod filter;
 mod tui;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -179,7 +180,7 @@ impl Prog {
 // ─────────────────────────────────────────────────────────── поток
 
 pub struct WorkerResult {
-    pub hits: Vec<(u32, Vec<u8>)>,
+    pub hits: u64,
     pub bytes: u64,
 }
 
@@ -192,9 +193,10 @@ pub fn worker(
     chunk: usize,
     want_lines: bool,
     overlap: usize,
+    lines_tx: Option<SyncSender<(u32, Vec<u8>)>>,
 ) -> io::Result<WorkerResult> {
     let mut local = vec![0u64; eng.npat()];
-    let mut hits: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut hits: u64 = 0;
     let mut buf = vec![0u8; chunk + overlap + 1];
     let mut tail = 0usize;
     let mut pos = start;
@@ -233,12 +235,18 @@ pub fn worker(
         }
         {
             let mut collect = |pi: usize, start: usize| {
-                if want_lines {
-                    let ls = memrchr(b'\n', &region[..start]).map(|i| i + 1).unwrap_or(0);
-                    let le = memchr(b'\n', &region[start..])
-                        .map(|i| start + i)
-                        .unwrap_or(region.len());
-                    hits.push((pi as u32, region[ls..le].to_vec()));
+                if !want_lines {
+                    return;
+                }
+                let ls = memrchr(b'\n', &region[..start]).map(|i| i + 1).unwrap_or(0);
+                let le = memchr(b'\n', &region[start..])
+                    .map(|i| start + i)
+                    .unwrap_or(region.len());
+                hits += 1;
+                if let Some(tx) = &lines_tx {
+                    // канал ограничен: если диск не успевает — поток притормозит,
+                    // зато память не растёт
+                    let _ = tx.send((pi as u32, region[ls..le].to_vec()));
                 }
             };
             eng.scan_region(region, &mut local, &mut collect);
@@ -263,6 +271,72 @@ pub fn worker(
     }
 
     Ok(WorkerResult { hits, bytes })
+}
+
+// ─────────────────────────────────────────────────────────── запись на диск
+
+// Строки уходят на диск сразу, через ограниченную очередь: пиковое потребление
+// памяти не зависит от числа совпадений.
+pub struct Sink {
+    tx: Option<SyncSender<(u32, Vec<u8>)>>,
+    handle: Option<std::thread::JoinHandle<io::Result<usize>>>,
+}
+
+impl Sink {
+    pub fn new(names: Vec<String>, out_dir: String, format: String, enabled: bool) -> Sink {
+        if !enabled {
+            return Sink { tx: None, handle: None };
+        }
+        let (tx, rx) = sync_channel::<(u32, Vec<u8>)>(8192);
+        let handle = std::thread::spawn(move || -> io::Result<usize> {
+            std::fs::create_dir_all(&out_dir)?;
+            let mut files: HashMap<u32, BufWriter<File>> = HashMap::new();
+            while let Ok((pi, line)) = rx.recv() {
+                if !files.contains_key(&pi) {
+                    let name = sanitize(&names[pi as usize]);
+                    let f = File::create(Path::new(&out_dir).join(format!("{name}.txt")))?;
+                    files.insert(pi, BufWriter::with_capacity(1 << 20, f));
+                }
+                let buf = format_line(&line, &format);
+                files.get_mut(&pi).unwrap().write_all(&buf)?;
+            }
+            let written = files.len();
+            for (_, mut f) in files {
+                f.flush()?;
+            }
+            Ok(written)
+        });
+        Sink { tx: Some(tx), handle: Some(handle) }
+    }
+
+    pub fn sender(&self) -> Option<SyncSender<(u32, Vec<u8>)>> {
+        self.tx.clone()
+    }
+
+    pub fn finish(mut self) -> io::Result<usize> {
+        drop(self.tx.take());
+        match self.handle.take() {
+            Some(h) => h.join().unwrap_or(Ok(0)),
+            None => Ok(0),
+        }
+    }
+}
+
+pub fn format_line(line: &[u8], format: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(line.len() + 1);
+    match format {
+        "login" => match parse_cred(line) {
+            Some((_, login, pass)) => {
+                out.extend_from_slice(login);
+                out.push(b':');
+                out.extend_from_slice(pass);
+            }
+            None => out.extend_from_slice(strip_cr(line)),
+        },
+        _ => out.extend_from_slice(strip_cr(line)),
+    }
+    out.push(b'\n');
+    out
 }
 
 // ─────────────────────────────────────────────────────────── запуск скана
@@ -296,12 +370,17 @@ impl ScanPlan {
 
 pub struct ScanOut {
     pub counts: Vec<u64>,
-    pub hits: Vec<(u32, Vec<u8>)>,
+    pub hits: u64,
     pub bytes: u64,
     pub secs: f64,
 }
 
-pub fn start_scan(eng: Arc<Engine>, plan: ScanPlan, prog: Arc<Prog>) -> std::thread::JoinHandle<io::Result<ScanOut>> {
+pub fn start_scan(
+    eng: Arc<Engine>,
+    plan: ScanPlan,
+    prog: Arc<Prog>,
+    lines_tx: Option<SyncSender<(u32, Vec<u8>)>>,
+) -> std::thread::JoinHandle<io::Result<ScanOut>> {
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let mut handles = Vec::new();
@@ -314,14 +393,16 @@ pub fn start_scan(eng: Arc<Engine>, plan: ScanPlan, prog: Arc<Prog>) -> std::thr
             let chunk = plan.chunk;
             let want_lines = plan.want_lines;
             let overlap = plan.overlap;
-            handles.push(std::thread::spawn(move || worker(eng, f, pr, lo, hi, chunk, want_lines, overlap)));
+            let tx = lines_tx.clone();
+            handles.push(std::thread::spawn(move || worker(eng, f, pr, lo, hi, chunk, want_lines, overlap, tx)));
         }
-        let mut hits = Vec::new();
+        drop(lines_tx);
+        let mut hits = 0u64;
         let mut bytes = 0u64;
         for h in handles {
             let r = h.join().unwrap()?;
             bytes += r.bytes;
-            hits.extend(r.hits);
+            hits += r.hits;
         }
         let counts: Vec<u64> = prog.counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         Ok(ScanOut { counts, hits, bytes, secs: t0.elapsed().as_secs_f64() })
@@ -418,6 +499,16 @@ pub fn recommend(disk: f64, scan: f64, cores: usize) -> usize {
     } else {
         // быстрый: разрешаем переподписку до двух раз, это помогает прятать задержки ввода-вывода
         need.clamp(2, cores * 2)
+    }
+}
+
+// Все буферы вместе не должны превышать ~256 МБ: на слабых машинах это спасает
+// от нехватки памяти, на сильных ничего не меняет.
+pub fn cache_budget(threads: usize, chunk_mb: &mut usize) {
+    let budget = 256usize;
+    let per_thread = (budget / threads.max(1)).max(8);
+    if *chunk_mb > per_thread {
+        *chunk_mb = per_thread;
     }
 }
 
@@ -669,6 +760,7 @@ fn main() -> io::Result<()> {
     };
     let threads = threads.max(1).min(((len / (8 * 1024 * 1024)) as usize).max(1));
 
+    cache_budget(threads, &mut chunk_mb);
     let plan = ScanPlan::build(Arc::clone(&file), len, threads, chunk_mb, overlap, want_lines)?;
     let prog = Arc::new(Prog::new(engine.npat(), len));
     let show_progress = io::stderr().is_terminal();
@@ -693,7 +785,8 @@ fn main() -> io::Result<()> {
         None
     };
 
-    let handle = start_scan(Arc::clone(&engine), plan, Arc::clone(&prog));
+    let sink = Sink::new(patterns.clone(), out_dir.clone(), format.clone(), want_lines);
+    let handle = start_scan(Arc::clone(&engine), plan, Arc::clone(&prog), sink.sender());
     let out = handle.join().unwrap()?;
     prog.stop.store(true, Ordering::Relaxed);
     if let Some(h) = reporter {
@@ -714,32 +807,8 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    if !count_only && !tsv {
-        std::fs::create_dir_all(&out_dir)?;
-        let mut files: Vec<Option<File>> = (0..patterns.len()).map(|_| None).collect();
-        for (p, line) in &out.hits {
-            let idx = *p as usize;
-            if files[idx].is_none() {
-                let name = sanitize(&patterns[idx]);
-                files[idx] = Some(File::create(Path::new(&out_dir).join(format!("{name}.txt")))?);
-            }
-            let mut buf: Vec<u8> = Vec::with_capacity(line.len() + 1);
-            match format.as_str() {
-                "login" => {
-                    if let Some((_, login, pass)) = parse_cred(line) {
-                        buf.extend_from_slice(login);
-                        buf.push(b':');
-                        buf.extend_from_slice(pass);
-                    } else {
-                        buf.extend_from_slice(strip_cr(line));
-                    }
-                }
-                _ => buf.extend_from_slice(strip_cr(line)),
-            }
-            buf.push(b'\n');
-            files[idx].as_mut().unwrap().write_all(&buf)?;
-        }
-    }
+    let files_written = sink.finish()?;
+    let _ = files_written;
 
     if tsv {
         for (i, p) in patterns.iter().enumerate() {
